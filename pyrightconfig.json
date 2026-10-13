@@ -1,0 +1,11 @@
+{
+  "include": [
+    "backend/src",
+    "backend/tests"
+  ],
+  "extraPaths": [
+    "backend/src"
+  ],
+  "pythonVersion": "3.14",
+  "typeCheckingMode": "standard"
+}
