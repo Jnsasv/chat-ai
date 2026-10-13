@@ -14,6 +14,7 @@ from data_chat.schemas.chat import (
     GeneratedAnswer,
 )
 from data_chat.schemas.intent import IntentDecision
+from data_chat.services.conversations import ConversationStore, ConversationTurn
 
 MAX_ANSWER_LENGTH = 2000
 RESULT_TOO_LARGE_MESSAGE = (
@@ -37,7 +38,11 @@ HTTP_URL_ADAPTER = TypeAdapter(HttpUrl)
 
 
 class IntentInterpreter(Protocol):
-    def interpret(self, question: str) -> IntentDecision: ...
+    def interpret(
+        self,
+        question: str,
+        history: Sequence[ConversationTurn] = (),
+    ) -> IntentDecision: ...
 
 
 class QueryRepository(Protocol):
@@ -81,16 +86,38 @@ class ChatWorkflow:
         interpreter: IntentInterpreter,
         repository: QueryRepository,
         answer_generator: AnswerGenerator,
+        conversations: ConversationStore | None = None,
     ) -> None:
         self._interpreter = interpreter
         self._repository = repository
         self._answer_generator = answer_generator
+        self._conversations = conversations
 
     def respond(self, request: ChatMessageRequest) -> ChatMessageResponse:
         conversation_id = request.conversation_id or uuid4()
+        history = (
+            self._conversations.history(conversation_id)
+            if self._conversations is not None
+            else ()
+        )
+        response = self._build_response(request, conversation_id, history)
+        if self._conversations is not None:
+            self._conversations.append(
+                conversation_id,
+                request.message.strip(),
+                response.answer,
+            )
+        return response
+
+    def _build_response(
+        self,
+        request: ChatMessageRequest,
+        conversation_id: UUID,
+        history: Sequence[ConversationTurn],
+    ) -> ChatMessageResponse:
         message_id = uuid4()
 
-        decision = self._interpreter.interpret(request.message)
+        decision = self._interpreter.interpret(request.message, history)
         if decision.outcome == "clarification_required":
             return ChatMessageResponse(
                 conversation_id=conversation_id,

@@ -22,7 +22,7 @@ class FakeInterpreter:
         self.decision = decision
         self.questions: list[str] = []
 
-    def interpret(self, question: str) -> IntentDecision:
+    def interpret(self, question: str, history=()) -> IntentDecision:
         self.questions.append(question)
         if isinstance(self.decision, Exception):
             raise self.decision
@@ -326,3 +326,44 @@ def test_new_conversation_id_is_created_without_claiming_persistence() -> None:
 
     assert isinstance(response.conversation_id, UUID)
     assert isinstance(response.message_id, UUID)
+
+
+def test_follow_up_receives_prior_turns_and_stores_new_turn() -> None:
+    from data_chat.services.conversations import ConversationStore, ConversationTurn
+
+    class RecordingInterpreter(FakeInterpreter):
+        def __init__(self, decisions: list[IntentDecision]) -> None:
+            super().__init__(decisions[0])
+            self.decisions = decisions
+            self.histories: list[tuple[ConversationTurn, ...]] = []
+
+        def interpret(self, question: str, history=()) -> IntentDecision:
+            self.histories.append(tuple(history))
+            return self.decisions.pop(0)
+
+    clarification = IntentDecision.model_validate(
+        {"outcome": "clarification_required", "clarification_question": "Which group?"}
+    )
+    interpreter = RecordingInterpreter(
+        [clarification, _decision(query_id="group_standings", group_code="DEMO-B")]
+    )
+    workflow = ChatWorkflow(
+        interpreter,
+        FakeRepository([{"team": "B1", "source_url": "https://www.fifa.com/x"}]),
+        FakeAnswerGenerator(GeneratedAnswer(status="answered", answer="B1 leads.")),
+        ConversationStore(),
+    )
+    conversation_id = UUID("b1d4876a-915b-432f-9c99-24f3a2a6fc4e")
+
+    first = workflow.respond(
+        ChatMessageRequest(conversation_id=conversation_id, message="Show standings")
+    )
+    second = workflow.respond(
+        ChatMessageRequest(conversation_id=conversation_id, message="DEMO-B")
+    )
+
+    assert interpreter.histories[0] == ()
+    assert interpreter.histories[1] == (
+        ConversationTurn("Show standings", first.answer),
+    )
+    assert second.status == "answered"

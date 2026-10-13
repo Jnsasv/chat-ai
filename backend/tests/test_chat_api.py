@@ -22,7 +22,7 @@ from data_chat.services.chat import (
 
 
 class ApiInterpreter:
-    def interpret(self, question: str) -> IntentDecision:
+    def interpret(self, question: str, history=()) -> IntentDecision:
         assert question
         return IntentDecision(outcome="unsupported")
 
@@ -76,23 +76,22 @@ def test_lifespan_wires_configured_workflow_and_closes_resources(
         "Database=WorldCup2026Dev;Trusted_Connection=yes;"
         "Encrypt=yes;TrustServerCertificate=no;",
     )
-    openai_client = Mock()
+    chat_model = Mock()
     engine = Mock()
-    create_openai_client = Mock(return_value=openai_client)
+    create_chat_model = Mock(return_value=chat_model)
     create_sql_server_engine = Mock(return_value=engine)
-    monkeypatch.setattr(main, "create_openai_client", create_openai_client)
+    monkeypatch.setattr(main, "create_chat_model", create_chat_model)
     monkeypatch.setattr(main, "create_sql_server_engine", create_sql_server_engine)
 
     with TestClient(app):
         assert isinstance(app.state.chat_workflow, ChatWorkflow)
-        create_openai_client.assert_called_once()
+        create_chat_model.assert_called_once()
         create_sql_server_engine.assert_called_once()
-        openai_client.responses.parse.assert_not_called()
+        chat_model.invoke.assert_not_called()
         engine.connect.assert_not_called()
 
     assert app.state.chat_workflow is None
     engine.dispose.assert_called_once()
-    openai_client.close.assert_called_once()
 
 
 def test_post_chat_returns_safe_unavailable_error_when_unconfigured(
@@ -176,7 +175,7 @@ def test_upstream_failure_uses_safe_error_envelope(
     expected_category: str,
 ) -> None:
     class FailingInterpreter:
-        def interpret(self, question: str) -> IntentDecision:
+        def interpret(self, question: str, history=()) -> IntentDecision:
             assert question
             if isinstance(failure, (OpenAIProviderError, InvalidLLMOutputError)):
                 raise failure

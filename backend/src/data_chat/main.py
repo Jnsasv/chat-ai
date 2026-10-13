@@ -5,7 +5,6 @@ import logging
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from openai import OpenAI
 from sqlalchemy.engine import Engine
 from starlette.requests import Request
 
@@ -19,12 +18,15 @@ from data_chat.data.repository import CatalogRepository
 from data_chat.llm.openai_intent import (
     InvalidLLMOutputError,
     OpenAIConfigurationError,
-    OpenAIIntentInterpreter,
     OpenAIProviderError,
-    create_openai_client,
 )
-from data_chat.llm.openai_answer import OpenAIAnswerGenerator
+from data_chat.llm.langchain_adapters import (
+    LangChainAnswerGenerator,
+    LangChainIntentInterpreter,
+    create_chat_model,
+)
 from data_chat.schemas.chat import ChatErrorResponse
+from data_chat.services.conversations import ConversationStore
 from data_chat.services.chat import (
     DataAccessError,
     DataAccessUnavailable,
@@ -60,7 +62,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if _is_missing_setting(connection_string):
         missing_settings.append("SQL_SERVER_ODBC_CONNECTION_STRING")
 
-    openai_client: OpenAI | None = None
     engine: Engine | None = None
     repository: CatalogRepository | None = None
     try:
@@ -70,39 +71,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 ", ".join(missing_settings),
             )
         else:
-            openai_client = create_openai_client(settings)
+            chat_model = create_chat_model(settings)
             engine = create_sql_server_engine(settings)
             repository = CatalogRepository(
                 engine,
                 max_rows=MAX_QUERY_RESULT_ROWS,
             )
-            model = settings.openai_model
-            if model is None:
-                raise OpenAIConfigurationError(
-                    "An OpenAI model ID is not configured."
-                )
             app.state.chat_workflow = ChatWorkflow(
-                OpenAIIntentInterpreter(
-                    openai_client,
-                    model,
-                ),
+                LangChainIntentInterpreter(chat_model),
                 repository,
-                OpenAIAnswerGenerator(
-                    openai_client,
-                    model,
-                ),
+                LangChainAnswerGenerator(chat_model),
+                ConversationStore(),
             )
         yield
     finally:
         app.state.chat_workflow = None
-        try:
-            if repository is not None:
-                repository.close()
-            elif engine is not None:
-                engine.dispose()
-        finally:
-            if openai_client is not None:
-                openai_client.close()
+        if repository is not None:
+            repository.close()
+        elif engine is not None:
+            engine.dispose()
 
 
 def _is_missing_setting(value: str | None) -> bool:

@@ -154,11 +154,22 @@ and message IDs, an answer, a status (`answered`, `clarification_required`,
 references. Request-validation errors do not echo submitted values; upstream
 and data errors use a generic error envelope.
 
-Conversation IDs are currently correlation identifiers only: there is no
-conversation history, persistence, ownership, or authentication. A caller
-supplying an existing ID receives that ID in the response but does not cause
-the previous conversation to be loaded. Define persistence and authorization
-before relying on multi-turn context.
+Conversation IDs key a short, in-memory history (last 6 turns, 30-minute TTL,
+at most 1,000 conversations, answers truncated to 500 characters). The history
+is passed to the intent step only, as untrusted context, so a follow-up such as
+"DEMO-B" after "Show the group standings" can be resolved. It is never returned
+to clients, is lost on restart, and has no ownership or authentication: anyone
+who knows a conversation UUID can append to it. Define persistence and
+authorization before public exposure.
+
+## LangChain
+
+The LLM calls go through `langchain-core` / `langchain-openai`
+(`backend/src/data_chat/llm/langchain_adapters.py`). Only the chat model
+factory is OpenAI-specific; the intent and answer adapters use
+`with_structured_output`, so another provider can be supported by changing
+`create_chat_model`. Query selection is unchanged: the LLM still never writes
+SQL.
 
 ## World Cup 2026 data model
 
@@ -229,13 +240,12 @@ large to summarize; the app asks the user to narrow the question.
 
 ## Current limitations
 
-- No conversation storage is available.
+- Conversation history is in memory only (see the Chat API contract).
 - The local DDL has been applied, but no FIFA facts have been imported.
 - The SQL Server repository and OpenAI adapters are assembled at app startup
   only when all required settings are valid.
 - No verified tournament facts have been imported, so supported data questions
   cannot yet return useful results.
-- Conversation IDs do not load or store message history.
 - User authentication and per-user authorization are not configured.
 - No live OpenAI request has been made. With valid settings, user questions and
   retrieved rows will be sent to OpenAI during chat requests.
