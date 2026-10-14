@@ -4,6 +4,13 @@ This document describes how a chat message moves through the local Data Chat
 application, how the database is populated for the demo, and what information
 is sent to OpenAI.
 
+The LLM calls go through LangChain (`langchain-core` and `langchain-openai`).
+LangChain is only a client library: it needs no separate account or key, and
+it uses the same `OPENAI_API_KEY`. It does not choose queries or write SQL; it
+only provides a provider-neutral way to request schema-constrained output. The
+optional LangSmith tracing service is not used and stays off unless
+`LANGSMITH_*` environment variables are set.
+
 To start the backend and frontend locally, see "Quick start (local demo)" in
 the [README](../README.md#quick-start-local-demo).
 
@@ -20,9 +27,10 @@ FastAPI request validation
   │ validates message length (1–2,000 characters) and request shape
   ▼
 ChatWorkflow
-  │ sends the question to OpenAI for intent classification
+  │ loads recent turns for the conversation_id (in-memory ConversationStore)
+  │ sends the question + that history to the LLM for intent classification
   ▼
-OpenAIIntentInterpreter
+LangChainIntentInterpreter (langchain-openai ChatOpenAI, structured output)
   │ returns a structured decision, validated as IntentDecision
   ├── clarification_required ──► response asks the user for a missing detail
   ├── unsupported ─────────────► response says the topic is not supported
@@ -40,12 +48,13 @@ OpenAIIntentInterpreter
          └── rows found
                 │ question + query ID + result rows sent to OpenAI
                 ▼
-            OpenAIAnswerGenerator
+            LangChainAnswerGenerator (structured output)
                 │ returns a structured answer
                 ▼
             ChatWorkflow
                 │ validates answer, attaches approved source references,
-                │ and prefixes a demo-only warning for synthetic records
+                │ prefixes a demo-only warning for synthetic records,
+                │ and stores the question/answer turn in the ConversationStore
                 ▼
             FastAPI JSON response ──► React renders answer, status, sources
 ```
@@ -57,13 +66,14 @@ question and an optional conversation ID. The frontend validates the response
 shape and only keeps HTTPS links on the approved FIFA source domains.
 
 The backend rejects malformed requests before processing them. Questions must
-contain 1–2,000 characters; extra request fields are rejected. A conversation
-ID is only a correlation identifier: the application does not persist or load
-conversation history.
+contain 1–2,000 characters; extra request fields are rejected. The conversation
+ID keys a short in-memory history (see "Conversation memory" below); nothing
+is persisted, and the history is never returned to the browser.
 
 ### 2. Intent classification
 
-The backend sends the user's question to OpenAI using the configured model.
+The backend sends the user's question, plus any recent turns of the same
+conversation, to the LLM using the configured model.
 OpenAI must return a structured intent: one of the supported query IDs and its
 parameters, a clarification request, or an unsupported-topic result.
 
@@ -150,8 +160,9 @@ non-empty string of no more than 2,000 characters and rejects extra fields.
 The backend then sends the question to the intent adapter. At this point it
 does not query SQL Server and does not send database rows to OpenAI.
 
-**Code links:** [workflow entry point](../backend/src/data_chat/services/chat.py#L85) →
-[intent adapter call](../backend/src/data_chat/llm/openai_intent.py#L74).
+**Code links:** [workflow entry point](../backend/src/data_chat/services/chat.py#L96) →
+[intent adapter call](../backend/src/data_chat/services/chat.py#L120) →
+[LangChain intent adapter](../backend/src/data_chat/llm/langchain_adapters.py#L63).
 
 **What OpenAI receives for intent classification:**
 
@@ -178,8 +189,9 @@ missing group code:
 }
 ```
 
-**Code links:** [supported intents and missing-parameter instructions](../backend/src/data_chat/llm/openai_intent.py#L13) →
-[OpenAI structured request](../backend/src/data_chat/llm/openai_intent.py#L84) →
+**Code links:** [supported intents and missing-parameter instructions](../backend/src/data_chat/llm/openai_intent.py#L2) →
+[structured-output model](../backend/src/data_chat/llm/langchain_adapters.py#L58) →
+[model call and error mapping](../backend/src/data_chat/llm/langchain_adapters.py#L142) →
 [intent response model](../backend/src/data_chat/schemas/intent.py#L18).
 
 **How the backend decides whether to act on it:** OpenAI does not select or
@@ -194,7 +206,7 @@ the required `group_code`, validation would reject it and the request would
 fail safely before SQL access.
 
 **Code links:** [cross-field validation](../backend/src/data_chat/schemas/intent.py#L38) →
-[clarification branch, which returns before SQL](../backend/src/data_chat/services/chat.py#L90).
+[clarification branch, which returns before SQL](../backend/src/data_chat/services/chat.py#L121).
 
 The backend returns a response like this (IDs and wording are illustrative):
 
@@ -213,9 +225,9 @@ The response shape is defined by
 
 ### Request 2: user supplies the group code
 
-The application does not store conversation turns or send history on a later
-request. The user must therefore include the full question again. The
-conversation ID is carried for correlation only:
+The user can reply with just the group code. The browser reuses the
+conversation ID from the first response, and the backend loads the earlier turn
+from its in-memory store:
 
 ```http
 POST /api/v1/chat/messages
@@ -223,20 +235,24 @@ Content-Type: application/json
 
 {
   "conversation_id": "b1d4876a-915b-432f-9c99-24f3a2a6fc4e",
-  "message": "Show the standings for group DEMO-A"
+  "message": "DEMO-A"
 }
 ```
 
-**Code links:** [frontend sends message and correlation ID](../frontend/src/App.tsx#L48) →
-[API request JSON](../frontend/src/api/chat.ts#L109). No prior conversation
-messages are attached.
+**Code links:** [frontend sends message and conversation ID](../frontend/src/App.tsx#L48) →
+[API request JSON](../frontend/src/api/chat.ts#L109) →
+[history is loaded for this ID](../backend/src/data_chat/services/chat.py#L98).
 
-**Intent-classification input:** The backend again sends the fixed intent
-instructions, the schema, and only this turn's question:
-`Show the standings for group DEMO-A`. It does not send the previous request
-or any database content for this step.
+**Intent-classification input:** The backend sends the fixed intent
+instructions plus `HISTORY_INSTRUCTIONS`, the schema, and the messages
+`Show the group standings` (user), `Which group do you want the standings
+for?` (assistant) and `DEMO-A` (user). The history is untrusted context used
+only to combine a short reply with the earlier request. Every query parameter
+must still be stated by the user in a user turn, never taken from assistant
+text alone. No database content is sent for this step.
 
-**Code link:** [intent adapter builds the OpenAI request](../backend/src/data_chat/llm/openai_intent.py#L74).
+**Code links:** [history instructions](../backend/src/data_chat/llm/langchain_adapters.py#L25) →
+[history becomes alternating human/AI messages](../backend/src/data_chat/llm/langchain_adapters.py#L63).
 
 **Intent decision:** OpenAI returns a structured proposal such as:
 
@@ -368,20 +384,24 @@ fields the backend processes and passes onward:
 [synthetic standings rows are seeded](../backend/sql/002_world_cup_2026_demo_seed.sql#L177).
 
 **What OpenAI receives for answer generation:** The backend makes a second
-OpenAI request containing the fixed answer instructions, the original
-question, the approved query ID, and the SQL result rows serialized as JSON.
+OpenAI request (no conversation history is included) containing the fixed
+answer instructions, the question text of this turn, the approved query ID, and the SQL result rows serialized as JSON.
 The serialized rows include the returned source URL and publisher, too. For
 this example, the effective input has this shape:
 
 ```text
 Approved query ID: group_standings
-User question: Show the standings for group DEMO-A
+User question: DEMO-A
 Database result rows (JSON): [{"group_code":"DEMO-A", ...,
   "source_publisher":"Synthetic demo data"}]
 ```
 
-**Code links:** [answer-generation instructions](../backend/src/data_chat/llm/openai_answer.py#L19) →
-[structured OpenAI answer request and serialized inputs](../backend/src/data_chat/llm/openai_answer.py#L38).
+**Code links:** [answer-generation instructions](../backend/src/data_chat/llm/openai_answer.py#L1) →
+[structured answer request and serialized inputs](../backend/src/data_chat/llm/langchain_adapters.py#L105).
+
+If the serialized rows exceed 30,000 characters, or the final answer would
+exceed 2,000 characters, the backend skips or discards the answer and returns a
+"narrow your question" clarification instead.
 
 The answer instructions tell OpenAI to use only these rows, treat the question
 and row values as untrusted data, and return the structured
@@ -393,9 +413,9 @@ the backend prepends its own warning and attaches a synthetic-data source
 label with no URLs. If there were no rows, it would return
 `insufficient_data` without making this second OpenAI request.
 
-**Code links:** [workflow checks rows and validates the answer](../backend/src/data_chat/services/chat.py#L119) →
-[demo notice is added by the backend](../backend/src/data_chat/services/chat.py#L154) →
-[publisher detection and synthetic source labeling](../backend/src/data_chat/services/chat.py#L167) →
+**Code links:** [workflow checks rows and validates the answer](../backend/src/data_chat/services/chat.py#L177) →
+[demo notice is added by the backend](../backend/src/data_chat/services/chat.py#L190) →
+[narrow-your-question response](../backend/src/data_chat/services/chat.py#L203) →
 [frontend renders answer and sources](../frontend/src/App.tsx#L131).
 
 ```json
@@ -414,16 +434,28 @@ label with no URLs. If there were no rows, it would return
 }
 ```
 
+## Conversation memory
+
+`ConversationStore` ([source](../backend/src/data_chat/services/conversations.py))
+keeps, per conversation ID, the last 6 question/answer turns (answers truncated
+to 500 characters), for at most 30 minutes and 1,000 conversations. It lives in
+the backend process memory only: it is lost on restart, is never returned to
+the client, and has no ownership or authentication, so anyone who knows a
+conversation UUID could add to it. History is used for intent classification
+only, as untrusted context. The backend never writes questions or answers to
+its logs.
+
 ## External data and privacy
 
-With a configured chat workflow, the user question is sent to OpenAI for intent
+With a configured chat workflow, the user question (and up to 6 recent turns of
+the same conversation) is sent to OpenAI for intent
 classification. If the approved SQL query returns rows, the question and those
 rows are sent to OpenAI again for answer generation. Do not include private or
 sensitive information in questions. The OpenAI API key stays in the local
 backend configuration and is not sent to the browser.
 
-At application startup, settings are read and the API client, SQL engine,
-repository, and workflow are assembled only when required settings are
+At application startup, settings are read and the chat model, SQL engine,
+repository, conversation store, and workflow are assembled only when required settings are
 configured. Startup itself does not send a question to OpenAI. Database
 connections are made when a query is executed. Resources are closed when the
 backend shuts down.
@@ -443,8 +475,12 @@ included in the response to the browser.
   `backend/src/data_chat/schemas/chat.py`
 - Intent contract and validation: `backend/src/data_chat/schemas/intent.py`
 - Workflow and source/demo labeling: `backend/src/data_chat/services/chat.py`
-- OpenAI intent and answer adapters: `backend/src/data_chat/llm/openai_intent.py`
-  and `backend/src/data_chat/llm/openai_answer.py`
+- LangChain intent and answer adapters and chat-model factory:
+  `backend/src/data_chat/llm/langchain_adapters.py`
+- Intent/answer instructions and shared LLM error types:
+  `backend/src/data_chat/llm/openai_intent.py` and
+  `backend/src/data_chat/llm/openai_answer.py`
+- In-memory conversation history: `backend/src/data_chat/services/conversations.py`
 - Fixed SQL query catalog: `backend/src/data_chat/data/catalog.py`
 - SQL Server repository and connection: `backend/src/data_chat/data/repository.py`
   and `backend/src/data_chat/data/connection.py`

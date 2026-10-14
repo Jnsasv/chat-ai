@@ -2,7 +2,8 @@
 
 Data Chat is planned as a web-based assistant for questions about approved SQL
 Server data. The current backend provides process health, validated settings,
-OpenAI structured-intent and answer adapters, a mockable chat workflow and HTTP
+LangChain-based structured-intent and answer adapters with short in-memory
+conversation memory, a mockable chat workflow and HTTP
 contract, a SQL Server schema, and a fixed query catalog. The workflow
 is assembled at app startup when valid OpenAI and SQL Server settings are
 present; startup itself does not make provider or database requests. Without
@@ -77,7 +78,12 @@ npm run dev -- --host=localhost --port=5173
 
 The `--host=` and `--port=` flags must use `=`; space-separated values fail.
 Open http://localhost:5173. Every question calls OpenAI with your key and may
-incur charges.
+incur charges. LangChain needs no separate key or account. To try the memory,
+ask "Show the group standings", then reply "DEMO-B".
+
+Logs: the backend prints only startup and warning/error events to the uvicorn
+terminal. Questions and answers are deliberately not logged, and conversation
+history is held in memory only and cannot be read back.
 
 Check that both are up:
 
@@ -119,8 +125,9 @@ OpenAI availability.
 .\.venv\Scripts\python.exe -m pytest -c backend\pyproject.toml backend\tests
 ```
 
-The tests do not require OpenAI credentials or an active SQL Server. Both
-structured OpenAI adapters and the HTTP chat workflow are tested using mocks.
+The tests do not require OpenAI credentials or an active SQL Server. The
+LangChain adapters (using mocked chat models), the conversation store and the
+HTTP chat workflow are tested without network access.
 The local chat endpoint can be exercised for its safe unavailable response,
 but no production workflow is configured.
 
@@ -247,7 +254,7 @@ large to summarize; the app asks the user to narrow the question.
 - No verified tournament facts have been imported, so supported data questions
   cannot yet return useful results.
 - User authentication and per-user authorization are not configured.
-- No live OpenAI request has been made. With valid settings, user questions and
-  retrieved rows will be sent to OpenAI during chat requests.
+- With valid settings, user questions, recent conversation turns and retrieved
+  rows are sent to OpenAI during chat requests.
 - Keep the service local until authentication, data handling, and deployment
   requirements are approved and implemented.
