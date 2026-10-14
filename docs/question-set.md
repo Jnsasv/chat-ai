@@ -15,7 +15,6 @@ Coverage legend:
 Existing queries: `tournament_teams`, `venues`, `matches_for_team`,
 `matches_at_venue`, `matches_by_stage`, `group_standings`,
 `team_final_placement`.
-
 ## Draft questions
 
 | # | Question | Coverage | Notes |
